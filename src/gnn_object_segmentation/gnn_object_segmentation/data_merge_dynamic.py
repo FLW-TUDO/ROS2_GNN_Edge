@@ -74,8 +74,8 @@ class DataMergerNodeDynamic(Node):
 
         # --- Dynamic Configuration ---
         # Declare as a list of strings (STRING_ARRAY) natively
-        # Note the default value is a real list ["rm04", "rm03"], not a string '["..."]'
-        self.declare_parameter("robot_list", ["rm04", "rm03", "rm05", "cr01"]) 
+        # Note the default value is a real list ["rm03", "rm04", "rm05", "cr01"], not a string '["..."]'
+        self.declare_parameter("robot_list", ["rm03", "rm04", "rm05", "cr01"]) 
         
         # Retrieve directly as a string array
         self.robot_names = self.get_parameter("robot_list").get_parameter_value().string_array_value
@@ -83,7 +83,7 @@ class DataMergerNodeDynamic(Node):
         # Safety check: if for some reason it's empty, fallback
         if not self.robot_names:
             self.get_logger().warn("Received empty robot_list. Falling back to default.")
-            self.robot_names = ["rm04", "rm03", "rm05", "cr01"]
+            self.robot_names = ["rm03", "rm04", "rm05", "cr01"]
 
         # Map robot names to numeric IDs (1, 2, 3...) based on their order in the list
         # IMPORTANT: The GNN .pt model might expect specific IDs (e.g. 1 and 2). 

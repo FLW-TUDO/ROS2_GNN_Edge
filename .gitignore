@@ -8,3 +8,8 @@ log/
 *.png
 .ccls-cache/
 datalogging/
+# macOS
+.DS_Store
+
+notion/
+

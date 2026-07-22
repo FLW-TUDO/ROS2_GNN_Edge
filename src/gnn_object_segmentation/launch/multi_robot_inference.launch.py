@@ -52,38 +52,38 @@ def generate_launch_description():
             description='List of robot namespaces passed as a JSON string'
         ),
 
-        # --- rosbag record ---
-        ExecuteProcess(
-            cmd=[
-                'ros2', 'bag', 'record', '-o', bag_dir,
-                'clock',
-                '/tf', '/tf_static', 
-                '/tracked_polygons', 'gnn_objects',
-                '/graph_data', 
-                '/navigate_to_pose/feedback', '/navigate_to_pose/result',
+        # # --- rosbag record ---
+        # ExecuteProcess(
+        #     cmd=[
+        #         'ros2', 'bag', 'record', '-o', bag_dir,
+        #         'clock',
+        #         '/tf', '/tf_static', 
+        #         '/tracked_polygons', 'gnn_objects',
+        #         '/graph_data', 
+        #         '/navigate_to_pose/feedback', '/navigate_to_pose/result',
                 
-                # --- rm03 topics ---
-                '/rm03/ti_mmwave/radar_scan_pcl', 'rm03/odom', '/rm03/vicon_pose',
-                '/rm03/global_costmap/costmap_raw', '/rm03/plan', '/rm03/path', 
-                '/rm03/cmd_vel', '/rm03/behavior_tree_log',
+        #         # --- rm03 topics ---
+        #         '/rm03/ti_mmwave/radar_scan_pcl', 'rm03/odom', '/rm03/vicon_pose',
+        #         '/rm03/global_costmap/costmap_raw', '/rm03/plan', '/rm03/path', 
+        #         '/rm03/cmd_vel', '/rm03/behavior_tree_log',
                 
-                # --- rm04 topics ---
-                '/rm04/ti_mmwave/radar_scan_pcl', 'rm04/odom', '/rm04/vicon_pose',
-                '/rm04/global_costmap/costmap_raw', '/rm04/plan', '/rm04/path', 
-                '/rm04/cmd_vel', '/rm04/behavior_tree_log',
+        #         # --- rm04 topics ---
+        #         '/rm04/ti_mmwave/radar_scan_pcl', 'rm04/odom', '/rm04/vicon_pose',
+        #         '/rm04/global_costmap/costmap_raw', '/rm04/plan', '/rm04/path', 
+        #         '/rm04/cmd_vel', '/rm04/behavior_tree_log',
 
-                # --- rm05 topics ---
-                '/rm05/ti_mmwave/radar_scan_pcl', 'rm05/odom', '/rm05/vicon_pose',
-                '/rm05/global_costmap/costmap_raw', '/rm05/plan', '/rm05/path', 
-                '/rm05/cmd_vel', '/rm05/behavior_tree_log',
+        #         # --- rm05 topics ---
+        #         '/rm05/ti_mmwave/radar_scan_pcl', 'rm05/odom', '/rm05/vicon_pose',
+        #         '/rm05/global_costmap/costmap_raw', '/rm05/plan', '/rm05/path', 
+        #         '/rm05/cmd_vel', '/rm05/behavior_tree_log',
 
-                # --- cr01 topics ---
-                '/cr01/ti_mmwave/radar_scan_pcl', 'cr01/odom', '/cr01/vicon_pose',
-                '/cr01/global_costmap/costmap_raw', '/cr01/plan', '/cr01/path', 
-                '/cr01/cmd_vel', '/cr01/behavior_tree_log'
-            ],
-            output='screen'
-        ),
+        #         # --- cr01 topics ---
+        #         '/cr01/ti_mmwave/radar_scan_pcl', 'cr01/odom', '/cr01/vicon_pose',
+        #         '/cr01/global_costmap/costmap_raw', '/cr01/plan', '/cr01/path', 
+        #         '/cr01/cmd_vel', '/cr01/behavior_tree_log'
+        #     ],
+        #     output='screen'
+        # ),
 
         # --- Dynamic Data Merger Node ---
         Node(
