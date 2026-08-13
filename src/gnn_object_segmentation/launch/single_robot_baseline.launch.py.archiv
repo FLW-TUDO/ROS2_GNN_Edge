@@ -1,0 +1,182 @@
+"""
+single_robot_baseline.launch.py
+
+Baseline launch file for the "no cross-robot fusion" benchmark, currently
+scoped to rm03 + rm04 as a first test before scaling to all 4 robots.
+
+WHAT THIS STARTS:
+  1. single_robot_graph_builder  (new node, package gnn_object_segmentation)
+     - Builds ONE independent graph per active robot (no cross-robot points).
+     - Publishes to /rm03/graph_data and /rm04/graph_data (NOT /graph_data).
+
+  2. TWO instances of the EXISTING, UNMODIFIED inference_node executable
+     (package gnn_inference) - one per robot - each remapped to subscribe
+     to that robot's own graph_data topic.
+
+     IMPORTANT: /tracked_polygons is deliberately LEFT UNREMAPPED on both
+     instances. Both publish to the SAME shared /tracked_polygons topic
+     that every robot's Nav2 costmap (gnn_objects_layer) already subscribes
+     to in production - so this requires ZERO changes on the robot side.
+     Since each instance only ever sees one robot's points, every
+     TrackedPolygon it emits will naturally have a single contributor_id,
+     which makes it easy to verify in the rosbag that no fusion occurred.
+
+  3. rosbag record of /rm03/graph_data, /rm04/graph_data, /tracked_polygons,
+     /gnn_objects, /tf, /tf_static - so this run's data lives in its own
+     bag directory, separate from full-fusion runs.
+
+WHAT THIS DOES NOT START:
+  - The original data_merge_dynamic (fused) node - not needed for this test.
+  - tracked_polygon_visualizer - add back in if you want RViz markers.
+
+NOT YET DONE / TODO before running:
+  - Confirm both inference_node processes can each load
+    configuration_flw_gnn_v1.yml / graph_based_detector.pt /
+    normalization_weights_unified.pkl concurrently from the working
+    directory without conflict (they're read-only loads, should be fine,
+    but verify on first run).
+  - single_robot_graph_builder needs to be added as a console_script entry
+    point in gnn_object_segmentation/setup.py, e.g.:
+        'single_robot_graph_builder = gnn_object_segmentation.single_robot_graph_builder:main'
+    and the package rebuilt (colcon build) before this launch file will
+    find the executable.
+"""
+
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
+from launch_ros.actions import Node
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution, TextSubstitution, PythonExpression
+from launch.actions import ExecuteProcess
+import datetime
+
+
+def generate_launch_description():
+    run_id = LaunchConfiguration('run_id')
+    timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+
+    bag_dir = PathJoinSubstitution([
+        TextSubstitution(text='datalogging/rosbags_single_robot_baseline/'),
+        run_id,
+        TextSubstitution(text=f'_{timestamp}_bag')
+    ])
+
+    # Per-robot run_id suffixes so the two inference_node CSV logs
+    # (datalogging/inference/<run_id>_<timestamp>/...) don't collide.
+    run_id_rm03 = PythonExpression(["'", run_id, "' + '_rm03'"])
+    run_id_rm04 = PythonExpression(["'", run_id, "' + '_rm04'"])
+
+    return LaunchDescription([
+        DeclareLaunchArgument('use_sim_time', default_value='False'),
+        DeclareLaunchArgument('run_id', default_value='baseline_run'),
+        DeclareLaunchArgument(
+            'active_robots', default_value='["rm03", "rm04"]',
+            description='Robots to process independently (no fusion) in this run'
+        ),
+        DeclareLaunchArgument(
+            'full_robot_list', default_value='["rm04", "rm03", "rm05", "cr01"]',
+            descrip/tion='MUST match the ordering used in production/training runs, '
+                        'so robot_id features stay consistent even when only testing a subset'
+        ),
+        DeclareLaunchArgument('window_size', default_value='5'),
+
+        # --- rosbag record: this run's own bag directory ---
+        ExecuteProcess(
+            cmd=[
+                'ros2', 'bag', 'record', '-o', bag_dir,
+                'clock', '/tf', '/tf_static',
+                '/rm03/graph_data', '/rm04/graph_data',
+                '/tracked_polygons', '/gnn_objects',
+            ],
+            output='screen'
+        ),
+
+        # --- Stage 1 (baseline): per-robot graph builder, no fusion ---
+        Node(
+            package='gnn_object_segmentation',
+            executable='single_robot_graph_builder',
+            name='single_robot_graph_builder',
+            parameters=[{/
+                "run_id": run_id,
+                "window_size": LaunchConfiguration('window_size'),
+                "active_robots": LaunchConfiguration('active_robots'),
+                "full_robot_list": LaunchConfiguration('full_robot_list'),
+                "use_sim_time": LaunchConfiguration('use_sim_time'),
+            }],
+            output='screen',
+        ),
+
+        # --- Stage 2: TWO unmodified inference_node instances, one per robot ---
+        Node(
+            package='gnn_inference',
+            executable='infere/nce_node',
+            name='gnn_inference_rm03',
+            output='screen',
+            parameters=[{
+                'run_id': run_id_rm03,
+                'use_sim_time': LaunchConfiguration('use_sim_time'),
+            }],
+            remappings=[
+                ('/graph_data', '/rm03/graph_data'),
+                # /tracked_polygons intentionally NOT remapped - shared topic,
+                # matches what the robot's costmap already subscribes to.
+            ],
+        ),
+        Node(
+            package='gnn_inference',
+            executable='inference_node',
+            name='gnn_inference_rm04',
+            output='screen',
+            parameters=[{
+                'run_id': run_id_rm04,
+                'use_sim_time': LaunchConfiguration('use_sim_time'),
+            }],
+            remappings=[
+                ('/graph_data', '/rm04/graph_data'),
+            ],
+        ),
+    ])
+        # --- Stage 1 (baseline): per-robot graph builder, no fusion ---
+        Node(
+            package='gnn_object_segmentation',
+            executable='single_robot_graph_builder',
+            name='single_robot_graph_builder',
+            parameters=[{
+                "run_id": run_id,
+                "window_size": LaunchConfiguration('window_size'),
+                "active_robots": LaunchConfiguration('active_robots'),
+                "full_robot_list": LaunchConfiguration('full_robot_list'),
+                "use_sim_time": LaunchConfiguration('use_sim_time'),
+            }],
+            output='screen',
+        ),
+
+        # --- Stage 2: TWO unmodified inference_node instances, one per robot ---
+        Node(
+            package='gnn_inference',
+            executable='inference_node',
+            name='gnn_inference_rm03',
+            output='screen',
+            parameters=[{
+                'run_id': run_id_rm03,
+                'use_sim_time': LaunchConfiguration('use_sim_time'),
+            }],
+            remappings=[
+                ('/graph_data', '/rm03/graph_data'),
+                # /tracked_polygons intentionally NOT remapped - shared topic,
+                # matches what the robot's costmap already subscribes to.
+            ],
+        ),
+        Node(
+            package='gnn_inference',
+            executable='inference_node',
+            name='gnn_inference_rm04',
+            output='screen',
+            parameters=[{
+                'run_id': run_id_rm04,
+                'use_sim_time': LaunchConfiguration('use_sim_time'),
+            }],
+            remappings=[
+                ('/graph_data', '/rm04/graph_data'),
+            ],
+        ),
+    ])

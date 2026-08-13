@@ -1,0 +1,285 @@
+"""
+single_robot_graph_builder.py
+
+Baseline / benchmark Stage-1 node for the "no cross-robot fusion" test.
+
+WHAT THIS DOES
+---------------
+Subclasses DataMergerNodeDynamic (from data_merge_dynamic.py) so ALL feature
+math is reused byte-for-byte and unchanged:
+    - process_radar_points()   (TF transform, proximity/bbox filters)
+    - calculate_metrics()      (range/azimuth/elevation)
+    - build_graph_from_window()/build_edge_index_and_features() (node/edge feats)
+    - normalize_column()/normalize_angle() (same normalization_weights_unified.pkl)
+
+What's DIFFERENT from data_merge_dynamic.py:
+    - No cross-robot fusion. Each active robot gets its OWN temporal window,
+      its OWN k-NN graph, built ONLY from its own radar points.
+    - Publishes to a PER-ROBOT topic, e.g. /rm03/graph_data, /rm04/graph_data
+      — NOT the shared /graph_data topic — so it can run side-by-side with,
+      or instead of, the fused data_merge_dynamic node without colliding.
+    - robot_id feature values are computed from `full_robot_list` (the SAME
+      robot ordering used in production/training), not from `active_robots`,
+      so IDs stay consistent with what the trained GNN model
+      (graph_based_detector.pt) expects, even when only testing a subset.
+
+Downstream: run one unmodified `gnn_inference_node` instance PER ROBOT,
+each remapped to subscribe to that robot's own /{robot}/graph_data topic.
+Do NOT remap /tracked_polygons - leave every instance publishing to the
+same shared /tracked_polygons topic, since that's what each robot's Nav2
+costmap plugin (gnn_objects_layer) already subscribes to. This means zero
+changes are needed on the robot side.
+
+WHY SUBCLASS INSTEAD OF REWRITE:
+Reusing DataMergerNodeDynamic's methods directly (rather than reimplementing
+normalization/filtering/feature math) guarantees the ONLY difference between
+a "fused" run and this "baseline" run is whether other robots' points are
+present in the graph - keeping the comparison valid.
+"""
+
+import os
+import csv
+import time
+import numpy as np
+from collections import deque
+from datetime import datetime
+
+import rclpy
+from sensor_msgs.msg import PointCloud2
+from geometry_msgs.msg import PoseWithCovarianceStamped
+from functools import partial
+from gnn_interfaces.msg import GraphData
+
+from .data_merge_dynamic import DataMergerNodeDynamic, statistical_outlier_removal
+
+
+class SingleRobotGraphBuilder(DataMergerNodeDynamic):
+
+    def __init__(self):
+        # Deliberately skip DataMergerNodeDynamic.__init__ (it wires up the
+        # FUSED subscriptions/publishers we don't want) and call Node.__init__
+        # directly via the grandparent, then set up only what we need,
+        # reusing inherited methods (process_radar_points, calculate_metrics,
+        # build_graph_from_window, etc.) which only depend on self.tf_buffer,
+        # self.robot_id_map, self.norm_weights, self.N, self.visualizer.
+        rclpy.node.Node.__init__(self, 'single_robot_graph_builder')
+
+        # --- Robot ID mapping: MUST match the ordering used in production/
+        # training runs, even if we're only testing a subset here, so the
+        # trained model sees the same robot_id feature values it expects. ---
+        self.declare_parameter("full_robot_list", ["rm04", "rm03", "rm05", "cr01"])
+        full_robot_list = self.get_parameter("full_robot_list").get_parameter_value().string_array_value
+        if not full_robot_list:
+            full_robot_list = ["rm04", "rm03", "rm05", "cr01"]
+        self.robot_id_map = {name: i + 1 for i, name in enumerate(full_robot_list)}
+
+        # --- Which robots THIS run actually processes/publishes for ---
+        self.declare_parameter("active_robots", ["rm03", "rm04"])
+        self.robot_names = self.get_parameter("active_robots").get_parameter_value().string_array_value
+        if not self.robot_names:
+            self.robot_names = ["rm03", "rm04"]
+
+        for name in self.robot_names:
+            if name not in self.robot_id_map:
+                self.get_logger().error(
+                    f"'{name}' is in active_robots but not in full_robot_list "
+                    f"({full_robot_list}) - its robot_id feature would be wrong. Fix the params."
+                )
+
+        self.get_logger().info(f"[BASELINE] Active robots (no fusion): {self.robot_names}")
+        self.get_logger().info(f"[BASELINE] robot_id map (from full_robot_list): {self.robot_id_map}")
+
+        self.clock = self.get_clock()
+        self.visualizer = None  # no viz for this baseline node
+
+        # --- Per-robot buffers (each robot fully independent - no shared buffer) ---
+        self.radar_buffer = {name: deque(maxlen=1000) for name in self.robot_names}
+        self.pose_buffer = {name: deque(maxlen=1000) for name in self.robot_names}
+        self.last_radar_timestamp = {name: 0.0 for name in self.robot_names}
+        self.last_vicon_timestamp = {name: 0.0 for name in self.robot_names}
+        self.merged_data_buffer = {name: deque(maxlen=100) for name in self.robot_names}
+        self.temporal_threshold = 2.0
+
+        # --- Subscriptions (radar/vicon), same topics as the fused node ---
+        self.pose_subs = []
+        self.radar_subs = []
+        for name in self.robot_names:
+            self.pose_subs.append(self.create_subscription(
+                PoseWithCovarianceStamped, f'/{name}/vicon_pose',
+                partial(self.vicon_callback_generic, robot_name=name), 10
+            ))
+            self.radar_subs.append(self.create_subscription(
+                PointCloud2, f'/{name}/ti_mmwave/radar_scan_pcl',
+                partial(self.radar_callback_generic, robot_name=name), 10
+            ))
+
+        # --- TF (identical usage to the fused node) ---
+        import tf2_ros
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+
+        # --- Per-robot graph publishers - THE key difference from the fused node ---
+        self.graph_pubs = {
+            name: self.create_publisher(GraphData, f'/{name}/graph_data', 10)
+            for name in self.robot_names
+        }
+
+        # --- Norm weights (identical file/usage to the fused node) ---
+        import pickle
+        try:
+            with open('normalization_weights_unified.pkl', 'rb') as f:
+                self.norm_weights = pickle.load(f)
+                print("✅ Norm weights loaded (single_robot_graph_builder)")
+        except FileNotFoundError:
+            self.get_logger().error("normalization_weights_unified.pkl NOT FOUND.")
+            self.norm_weights = {}
+
+        # --- Params matching the fused node's semantics ---
+        self.declare_parameter("run_id", "baseline_run")
+        self.run_id = self.get_parameter("run_id").get_parameter_value().string_value
+        self.declare_parameter("window_size", 5)
+        self.N = self.get_parameter("window_size").get_parameter_value().integer_value
+
+        # --- Logging: one CSV, robot_name as a column, for direct comparison
+        # against the fused node's log format ---
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        self.log_dir = os.path.join("datalogging/single_robot_baseline", f"{self.run_id}_{timestamp}")
+        os.makedirs(self.log_dir, exist_ok=True)
+        self.csv_path = os.path.join(self.log_dir, "single_robot_graph_builder_log.csv")
+        with open(self.csv_path, mode='w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "timestamp_ros", "run_id", "robot_name", "window_size",
+                "raw_points", "post_sor_points",
+                "node_count", "edge_count",
+                "graph_build_time_ms", "merge_latency_ms", "vicon_delay_ms"
+            ])
+
+        self.create_timer(0.03, self.sync_and_merge)
+
+    # --- Small parameterized helper - same logic as the parent's
+    # get_recent_window_frames(), just operating on a given robot's own
+    # buffer instead of self.merged_data_buffer (which is now a dict). ---
+    def get_recent_window_frames_for(self, buffer, current_time):
+        valid_frames = []
+        for frame in reversed(buffer):
+            if abs(current_time - frame['timestamp']) <= self.temporal_threshold:
+                valid_frames.append(frame)
+            if len(valid_frames) == self.N:
+                break
+        if not valid_frames and buffer:
+            return [buffer[-1]]
+        return list(valid_frames)
+
+    def sync_and_merge(self):
+        """Per-robot version: each robot is synced/processed/published
+        completely independently - no shared reference timestamp, no
+        cross-robot k-NN graph. This is the direct replacement for the
+        parent class's fused sync_and_merge()."""
+        now = self.clock.now().nanoseconds * 1e-9
+        fresh_threshold = 0.75
+
+        for name in self.robot_names:
+            merge_start_time = time.perf_counter()
+
+            if not self.radar_buffer[name]:
+                continue
+
+            latest_ts = self.radar_buffer[name][-1][0]
+            if now - latest_ts > fresh_threshold:
+                continue
+
+            radar_match = self.get_closest(self.radar_buffer[name], latest_ts)
+            if not radar_match:
+                continue
+
+            gnn_pts, _ = self.process_radar_points(
+                radar_match[1], name, radar_match[0], self.robot_id_map[name]
+            )
+            raw_count = len(gnn_pts)
+
+            if len(gnn_pts) >= 15:
+                pts_array = np.array([[pt['x'], pt['y'], pt['z']] for pt in gnn_pts])
+                filtered = statistical_outlier_removal(pts_array, k=8, std_ratio=1.0)
+                filtered_set = set(map(tuple, filtered))
+                gnn_pts = [pt for pt in gnn_pts if (pt['x'], pt['y'], pt['z']) in filtered_set]
+            post_sor_count = len(gnn_pts)
+
+            if post_sor_count == 0:
+                merge_latency_ms = round((time.perf_counter() - merge_start_time) * 1000, 3)
+                self._log_row(now, name, raw_count, post_sor_count, 0, 0, 0.0, merge_latency_ms)
+                continue
+
+            merged_data = {'timestamp': radar_match[0], 'poses': {}, 'radar_points': {name: gnn_pts}}
+            self.merged_data_buffer[name].append(merged_data)
+
+            graph_start = time.time()
+            window_frames = self.get_recent_window_frames_for(self.merged_data_buffer[name], merged_data['timestamp'])
+            graph_data = self.build_graph_from_window(window_frames, self.norm_weights)
+            graph_time_ms = round((time.time() - graph_start) * 1000, 2)
+
+            node_count, edge_count = 0, 0
+            if graph_data:
+                node_feats, edge_index, edge_attr = graph_data
+                if edge_attr.shape[0] > 0 and edge_index.shape[1] > 0:
+                    self.publish_graph_to(self.graph_pubs[name], node_feats, edge_index, edge_attr)
+                    node_count = node_feats.shape[0]
+                    edge_count = edge_index.shape[1]
+
+            vicon_delay_ms = 0.0
+            last_vicon_ts = self.last_vicon_timestamp.get(name, 0.0)
+            if last_vicon_ts > 0:
+                vicon_delay_ms = round((now - last_vicon_ts) * 1000, 2)
+
+            merge_latency_ms = round((time.perf_counter() - merge_start_time) * 1000, 3)
+            self._log_row(
+                now, name, raw_count, post_sor_count, node_count, edge_count,
+                graph_time_ms, merge_latency_ms, vicon_delay_ms
+            )
+
+        # Cleanup, same age-based pruning as the fused node
+        max_buffer_age = 1.5
+        self.prune_buffer(self.radar_buffer, max_buffer_age, now)
+        self.prune_buffer(self.pose_buffer, max_buffer_age, now)
+        for name in self.robot_names:
+            self.merged_data_buffer[name] = deque(
+                [f for f in self.merged_data_buffer[name] if now - f['timestamp'] < max_buffer_age],
+                maxlen=100
+            )
+
+    def publish_graph_to(self, publisher, node_features, edge_index, edge_attr):
+        """Same as the parent's publish_graph(), parameterized by which
+        per-robot publisher to send to."""
+        msg = GraphData()
+        msg.header.frame_id = "map"
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.node_features = node_features.flatten().tolist()
+        msg.node_feature_dim = node_features.shape[1] if node_features.ndim == 2 else 0
+        msg.edge_index = edge_index.flatten().tolist()
+        msg.edge_attr = edge_attr.flatten().tolist()
+        msg.edge_attr_dim = edge_attr.shape[1] if (edge_attr.ndim == 2 and edge_attr.shape[0] > 0) else 0
+        msg.num_nodes = node_features.shape[0]
+        msg.num_edges = edge_index.shape[1] if edge_index.ndim == 2 else 0
+        publisher.publish(msg)
+
+    def _log_row(self, now, robot_name, raw_count, post_sor_count, node_count, edge_count,
+                 graph_time_ms, merge_latency_ms, vicon_delay_ms=0.0):
+        with open(self.csv_path, mode='a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                now, self.run_id, robot_name, self.N,
+                raw_count, post_sor_count,
+                node_count, edge_count,
+                graph_time_ms, merge_latency_ms, vicon_delay_ms
+            ])
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = SingleRobotGraphBuilder()
+    rclpy.spin(node)
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
